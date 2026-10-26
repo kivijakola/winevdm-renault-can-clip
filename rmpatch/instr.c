@@ -24,6 +24,7 @@
 
 #include "windef.h"
 #include "winbase.h"
+#include "wine/library.h"
 #include "wine/winuser16.h"
 #include "wine/exception.h"
 
@@ -179,7 +180,9 @@ static BYTE *get_addr(int seg, int base)
 {
     LDT_ENTRY entry;
     /* Make sure the segment and offset are valid */
-    if(wine_ldt_is_system(seg)) return (BYTE *)base;
+    if (!(seg & ~3)) return NULL;
+    if (!(seg & 4) && ((unsigned)seg >> 3) < WINE_HOST_GDT_INDEX_MAX) return (BYTE *)base;
+    if (wine_ldt_is_system(seg) && (seg & 4)) return (BYTE *)base;
     if((seg & 7) != 7) return NULL;
     wine_ldt_get_entry(seg, &entry);
     if(wine_ldt_is_empty(&entry)) return NULL;

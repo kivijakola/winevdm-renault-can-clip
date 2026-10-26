@@ -715,7 +715,15 @@ BOOL16 WINAPI AnyPopup16(void)
  */
 HCURSOR16 WINAPI SetCursor16(HCURSOR16 hCursor)
 {
-  return get_icon_16( SetCursor( get_icon_32(hCursor) ));
+    HICON h32 = 0;
+    if (hCursor)
+        h32 = get_icon_32(hCursor);
+    /* Null class cursor / failed MAKEINTRESOURCE load used to SetCursor(NULL)
+     * on every WM_SETCURSOR, which hides the pointer while hover still works.
+     * ASDE does not import ShowCursor; 0 here means "default arrow". */
+    if (!h32)
+        h32 = LoadCursorA(NULL, IDC_ARROW);
+    return get_icon_16(SetCursor(h32));
 }
 
 
@@ -1384,15 +1392,11 @@ static BOOL is_builtin_winhlp32_stub()
 #ifndef FILE_VER_GET_NEUTRAL
 #define FILE_VER_GET_NEUTRAL 0x02
 #endif
-#ifndef GetFileVersionInfoSizeEx
-        typedef BOOL (WINAPI*GetFileVersionInfoExW_t)(LPCWSTR lptstrFilename, LPDWORD lpdwHandle, DWORD dwHandle,DWORD dwLen, LPVOID lpData);
-        static GetFileVersionInfoExW_t GetFileVersionInfoExW;
-        if (!GetFileVersionInfoExW)
-        {
-            GetFileVersionInfoExW = (GetFileVersionInfoExW_t)GetProcAddress(GetModuleHandleA("version"), "GetFileVersionInfoExW");
-        }
-#endif
-        if (GetFileVersionInfoExW(FILE_VER_GET_NEUTRAL, winhlp32, 0, size, vd))
+        typedef BOOL (WINAPI *PFN_GetFileVersionInfoExW)(DWORD dwFlags, LPCWSTR filename, DWORD dwHandle, DWORD dwLen, LPVOID lpData);
+        static PFN_GetFileVersionInfoExW pGetFileVersionInfoExW;
+        if (!pGetFileVersionInfoExW)
+            pGetFileVersionInfoExW = (PFN_GetFileVersionInfoExW)GetProcAddress(GetModuleHandleA("version"), "GetFileVersionInfoExW");
+        if (pGetFileVersionInfoExW && pGetFileVersionInfoExW(FILE_VER_GET_NEUTRAL, winhlp32, 0, size, vd))
         {
             WCHAR *internalname = NULL;
             UINT ulen;
@@ -1475,7 +1479,9 @@ BOOL16 WINAPI WinHelp16( HWND16 hWnd, LPCSTR lpHelpFile, UINT16 wCommand,
  */
 HCURSOR16 WINAPI LoadCursor16(HINSTANCE16 hInstance, LPCSTR name)
 {
-    return LoadImage16( hInstance, name, IMAGE_CURSOR, 0, 0, LR_SHARED | LR_DEFAULTSIZE );
+    if (!name)
+        name = MAKEINTRESOURCEA(IDC_ARROW);
+    return LoadImage16( hInstance, name, IMAGE_CURSOR, 0, 0, LR_SHARED );
 }
 
 
@@ -1857,9 +1863,9 @@ static LPCSTR parse_menu_resource( SEGPTR segres, HMENU hMenu, BOOL oldFormat )
             id = GET_WORD(res);
             res += sizeof(WORD);
         }
-        str = *res ? res : NULL;
-        res += strlen(res) + 1;
-        if (str && (flags & MF_OWNERDRAW)) str = segres + (str - start);
+        str = res;
+        res += strlen(str) + 1;
+        if (flags & MF_OWNERDRAW) str = segres + (str - start);
         if (flags & MF_POPUP)
         {
             HMENU hSubMenu = CreatePopupMenu();
@@ -1868,7 +1874,10 @@ static LPCSTR parse_menu_resource( SEGPTR segres, HMENU hMenu, BOOL oldFormat )
             AppendMenuA( hMenu, flags, (UINT_PTR)hSubMenu, str );
         }
         else  /* Not a popup */
-            AppendMenuA( hMenu, flags, id, str );
+        {
+            LPCSTR newitem = flags & MF_OWNERDRAW ? str : (*str ? str : NULL);
+            AppendMenuA( hMenu, flags, id, newitem );
+        }
     } while (!end_flag);
     return res;
 }
@@ -2738,12 +2747,21 @@ HANDLE16 WINAPI LoadImage16(HINSTANCE16 hinst, LPCSTR name, UINT16 type, INT16 c
 
     if (!hinst || (flags & LR_LOADFROMFILE) || (hinst && hinst == GetModuleHandle16("DISPLAY")))
     {
-        //OEMRESOURCE
-        WORD n = (WORD)name;
+        //OEMRESOURCE — name is MAKEINTRESOURCE(id) or a mapped string.
+        WORD n = IS_INTRESOURCE(name) ? LOWORD((DWORD_PTR)name) : 0;
         HINSTANCE hinst32 = NULL;
+        UINT oem_flags = flags & ~LR_DEFAULTSIZE;
+        HANDLE h;
+        if (!n && type == IMAGE_CURSOR)
+            n = (WORD)(DWORD_PTR)IDC_ARROW;
+        if (!n && name && !IS_INTRESOURCE(name))
+        {
+            h = LoadImageA(0, name, type, cx, cy, oem_flags);
+            goto oem_done;
+        }
         if ((n == OBM_OLD_CLOSE) || (n == OBM_BTNCORNERS))
             hinst32 = GetModuleHandleA("user.exe16");
-        HANDLE h = LoadImageA(hinst32, n, type, cx, cy, flags);
+        h = LoadImageA(hinst32, MAKEINTRESOURCEA(n), type, 0, 0, oem_flags);
         if (!h)
         {
             //OBM_OLD_XXXX->OBM_XXXX
@@ -2785,12 +2803,15 @@ HANDLE16 WINAPI LoadImage16(HINSTANCE16 hinst, LPCSTR name, UINT16 type, INT16 c
             default:
                 break;
             }
-            h = LoadImageA(0, n, type, cx, cy, flags);
+            h = LoadImageA(0, MAKEINTRESOURCEA(n), type, 0, 0, oem_flags);
+            if (h == 0 && type == IMAGE_CURSOR)
+                h = LoadCursorA(NULL, IDC_ARROW);
             if (h == 0)
             {
                 ERR("LoadImageA(%d, %d, %d, %d, %d, %d)\n", 0, n, type, cx, cy, flags);
             }
         }
+    oem_done:
         if (type == IMAGE_BITMAP)
             return HBITMAP_16(h);
         else
@@ -2809,13 +2830,15 @@ HANDLE16 WINAPI LoadImage16(HINSTANCE16 hinst, LPCSTR name, UINT16 type, INT16 c
     {
         if (type == IMAGE_ICON)
         {
-            if (!cx) cx = GetSystemMetrics(SM_CXICON);
-            if (!cy) cy = GetSystemMetrics(SM_CYICON);
+            if (!cx) cx = 32;
+            if (!cy) cy = 32;
         }
         else if (type == IMAGE_CURSOR)
         {
-            if (!cx) cx = GetSystemMetrics(SM_CXCURSOR);
-            if (!cy) cy = GetSystemMetrics(SM_CYCURSOR);
+            /* Win16 cursors are 32x32. SM_CXCURSOR follows DPI (48/64) and
+             * LookupIconIdFromDirectory then misses the resource. */
+            if (!cx) cx = 32;
+            if (!cy) cy = 32;
         }
     }
 
@@ -2935,7 +2958,9 @@ HANDLE16 WINAPI LoadImage16(HINSTANCE16 hinst, LPCSTR name, UINT16 type, INT16 c
         if (!is_old)
         {
             if (!(handle = LoadResource16(hinst, hRsrc))) return 0;
-            if ((dir = LockResource16(handle))) id = LookupIconIdFromDirectory(dir, type == IMAGE_ICON);
+            if ((dir = LockResource16(handle)))
+                id = LookupIconIdFromDirectoryEx(dir, type == IMAGE_ICON,
+                                                cx ? cx : 32, cy ? cy : 32, 0);
             FreeResource16(handle);
             if (!id) return 0;
             if (!(hRsrc = FindResource16( hinst, MAKEINTRESOURCEA(id),
@@ -3387,6 +3412,21 @@ INT16 WINAPI wvsprintf16( LPSTR buffer, LPCSTR spec, VA_LIST16 args )
         }
         *p = 0;
         ret = p - buffer;
+        if (spec && strstr(spec, "PERIPH") && buffer)
+        {
+            FILE *lf = fopen("C:\\ASDE\\profile16.log", "a");
+            if (lf)
+            {
+                LONG nrefs = 0;
+                UINT16 nlen = 0, nalloc = 0;
+                memcpy(&nrefs, buffer - 8, sizeof nrefs);
+                memcpy(&nlen, buffer - 4, sizeof nlen);
+                memcpy(&nalloc, buffer - 2, sizeof nalloc);
+                fprintf(lf, "wsprintf spec='%.40s' out='%.40s' n=%d nrefs=%ld nlen=%u nalloc=%u\n",
+                        spec, buffer, ret, (long)nrefs, nlen, nalloc);
+                fclose(lf);
+            }
+        }
     }
     __EXCEPT_ALL
     {
@@ -3598,11 +3638,9 @@ WORD WINAPI GetIconID16( HGLOBAL16 hResource, DWORD resType )
     switch (resType)
     {
     case (DWORD)RT_CURSOR:
-        return LookupIconIdFromDirectoryEx16( dir, FALSE, GetSystemMetrics(SM_CXCURSOR),
-                                              GetSystemMetrics(SM_CYCURSOR), LR_MONOCHROME );
+        return LookupIconIdFromDirectoryEx16( dir, FALSE, 32, 32, LR_MONOCHROME );
     case (DWORD)RT_ICON:
-        return LookupIconIdFromDirectoryEx16( dir, TRUE, GetSystemMetrics(SM_CXICON),
-                                              GetSystemMetrics(SM_CYICON), 0 );
+        return LookupIconIdFromDirectoryEx16( dir, TRUE, 32, 32, 0 );
     }
     return 0;
 }

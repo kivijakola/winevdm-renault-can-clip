@@ -621,13 +621,7 @@ static void set_thread_internal_windows_ver(DWORD version)
         /* init user32 */
         PeekMessageW(&msg, NULL, 0, 0, 0);
     }
-    /* On Wine's new WoW64 this TEB slot is win32u's client_imm, not dwExpWinVer;
-     * writing 0x030A here crashes imm32.  Wine gets the version from the module, so skip. */
-    {
-        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-        if (!(ntdll && GetProcAddress(ntdll, "wine_get_version")))
-            *lpdwExpWinVer = version;
-    }
+    *lpdwExpWinVer = version;
 }
 
 static void cwd_warning(void)

@@ -334,7 +334,7 @@ static int get_function_argsize( const ORDDEF *odp )
 static void output_call16_function( ORDDEF *odp )
 {
     char *name;
-    int i, pos, stack_words;
+    int i, pos, stack_words, ptr_lbl = 0;
     int argsize = get_function_argsize( odp );
     int needs_ldt = (strpbrk( get_args_str( odp ), "pt" ) != NULL);
 
@@ -424,10 +424,30 @@ static void output_call16_function( ORDDEF *odp )
         case ARG_WSTR:
         case ARG_INT128:
             if (odp->type != TYPE_PASCAL) pos -= 4;
+            /* NTVDM WOWGetVDMPointer: GDT -> NULL, not (void*)offset.
+             * Selector 0 is MAKEINTRESOURCE(offset) (LoadCursor IDC_ARROW
+             * is 0000:7F00). Mapping that to NULL hides the cursor. */
+            ptr_lbl++;
             output( "\tmovzwl %d(%%ecx),%%edx\n", pos + 2 ); /* sel */
-            output( "\tshr $3,%%edx\n" );
-            output( "\tmovzwl %d(%%ecx),%%eax\n", pos ); /* offset */
-            output( "\taddl (%%esi,%%edx,4),%%eax\n" );
+            output( "\ttestl %%edx,%%edx\n" );
+            output( "\tjz .L__wine_ptr_intres_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( "\ttestl $4,%%edx\n" ); /* TI = LDT */
+            output( "\tjz .L__wine_ptr_null_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( "\tshrl $3,%%edx\n" );
+            output( "\tcmpl $8192,%%edx\n" );
+            output( "\tjae .L__wine_ptr_null_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( "\tmovl (%%esi,%%edx,4),%%eax\n" );
+            output( "\ttestl %%eax,%%eax\n" );
+            output( "\tjz .L__wine_ptr_ok_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( "\tmovzwl %d(%%ecx),%%edx\n", pos ); /* offset */
+            output( "\taddl %%edx,%%eax\n" );
+            output( "\tjmp .L__wine_ptr_ok_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( ".L__wine_ptr_intres_%s_%d:\n", get_relay_name(odp), ptr_lbl );
+            output( "\tmovzwl %d(%%ecx),%%eax\n", pos ); /* offset as int resource */
+            output( "\tjmp .L__wine_ptr_ok_%s_%d\n", get_relay_name(odp), ptr_lbl );
+            output( ".L__wine_ptr_null_%s_%d:\n", get_relay_name(odp), ptr_lbl );
+            output( "\txorl %%eax,%%eax\n" );
+            output( ".L__wine_ptr_ok_%s_%d:\n", get_relay_name(odp), ptr_lbl );
             output( "\tpushl %%eax\n" );
             if (odp->type == TYPE_PASCAL) pos += 4;
             break;
@@ -736,8 +756,13 @@ static void output_module16( DLLSPEC *spec )
         }
         else if (typelist[i]->flags & FLAG_RET16)
         {
+            /* 16-bit KERNEL string APIs leave DX=DS (last les/mov dx,ds).
+             * NTVDM does that; wine restored pre-call DX which can be a
+             * GDT leftover after mingw stdcall. NSDACQUI then push DX:AX
+             * into MFC CString. */
+            output( "\tmovw %%ds,%%dx\n" );
             output( "\torw %%ax,%%ax\n" );
-            nop_words = 4;
+            nop_words = 3;
         }
         else
         {

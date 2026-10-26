@@ -39,10 +39,21 @@ void *wine_ldt_get_ptr(unsigned short sel, unsigned long offset)
 {
 	int index;
 
+	if (!(sel & ~3))
+		return NULL;
+
 	if (is_gdt_sel(sel))  /* GDT selector */
+	{
+		if ((sel >> 3) >= WINE_HOST_GDT_INDEX_MAX)
+			return NULL;
 		return (void *)offset;
+	}
 	if ((index = (sel >> 3)) < LDT_FIRST_ENTRY)  /* system selector */
 		return (void *)offset;
+	if (index >= LDT_SIZE)
+		return NULL;
+	if (!(wine_ldt_copy.flags[index] & WINE_LDT_FLAGS_ALLOCATED) || !wine_ldt_copy.base[index])
+		return NULL;
 	if (!(wine_ldt_copy.flags[index] & WINE_LDT_FLAGS_32BIT)) offset &= 0xffff;
 	return (char *)wine_ldt_copy.base[index] + offset;
 }

@@ -432,6 +432,7 @@ typedef struct {
 DECL_WINELIB_TYPE_AW(MCI_OPEN_DRIVER_PARMS)
 DECL_WINELIB_TYPE_AW(LPMCI_OPEN_DRIVER_PARMS)
 
+#ifndef __MINGW32__
 DWORD_PTR		WINAPI	mciGetDriverData(UINT uDeviceID);
 BOOL			WINAPI	mciSetDriverData(UINT uDeviceID, DWORD_PTR dwData);
 UINT			WINAPI	mciDriverYield(UINT uDeviceID);
@@ -440,6 +441,7 @@ BOOL			WINAPI	mciDriverNotify(HWND hwndCallback, UINT uDeviceID,
 UINT			WINAPI	mciLoadCommandResource(HINSTANCE hInstance,
 					       LPCWSTR lpResName, UINT uType);
 BOOL			WINAPI	mciFreeCommandResource(UINT uTable);
+#endif
 
 #define DCB_NULL		0x0000
 #define DCB_WINDOW		0x0001			/* dwCallback is a HWND */

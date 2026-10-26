@@ -567,21 +567,29 @@ UINT get_segment_descriptor_wine(int sreg);
 INLINE UINT32 i386_translate(int segment, UINT32 ip, int rwn)
 {
 	// TODO: segment limit access size, execution permission, handle exception thrown from exception handler
+	int use = segment;
 	if(PROTECTED_MODE && !V8086_MODE && (rwn != -1))
 	{
-		if(!(m_sreg[segment].valid))
-			FAULT_THROW((segment==SS)?FAULT_SS:FAULT_GP, 0);
-		if(i386_limit_check(segment, ip))
-			FAULT_THROW((segment==SS)?FAULT_SS:FAULT_GP, 0);
-		if((rwn == 0) && ((m_sreg[segment].flags & 8) && !(m_sreg[segment].flags & 2)))
+		/* Win16/Borland: 0000:off is DS:off. NSDBASES does
+		 *   mov cx,[bp-4] / mov es,cx / mov al,es:[bx]
+		 * after a CString helper that returns offset in AX and 0 in DX
+		 * (NTVDM often leaves DS in DX; we do not). SS stays strict. */
+		if(!(m_sreg[segment].selector & ~0x0003) && segment != CS && segment != SS)
+		{
+			use = DS;
+			if(!(m_sreg[DS].selector & ~0x0003) || !m_sreg[DS].valid)
+				FAULT_THROW(FAULT_GP, 0);
+		}
+		if(!(m_sreg[use].valid))
+			FAULT_THROW((use==SS)?FAULT_SS:FAULT_GP, 0);
+		if(i386_limit_check(use, ip))
+			FAULT_THROW((use==SS)?FAULT_SS:FAULT_GP, 0);
+		if((rwn == 0) && ((m_sreg[use].flags & 8) && !(m_sreg[use].flags & 2)))
 			FAULT_THROW(FAULT_GP, 0);
-		if((rwn == 1) && ((m_sreg[segment].flags & 8) || !(m_sreg[segment].flags & 2)))
+		if((rwn == 1) && ((m_sreg[use].flags & 8) || !(m_sreg[use].flags & 2)))
 			FAULT_THROW(FAULT_GP, 0);
 	}
-	//
-	//return get_segment_descriptor_wine(segment) + ip;
-	//
-	return m_sreg[segment].base + ip;
+	return m_sreg[use].base + ip;
 }
 
 #define VTLB_FLAG_DIRTY 0x100

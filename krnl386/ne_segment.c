@@ -418,17 +418,9 @@ BOOL NE_LoadSegment( NE_MODULE *pModule, WORD segnum )
     else if (!(pSeg->flags & NE_SEGFLAGS_ITERATED))
     {
         void *mem = GlobalLock16(pSeg->hSeg);
-        /* A data segment with a zero on-disk length but a non-zero minalloc is
-           BSS: there is nothing to read. Reading `size` == minsize bytes here
-           would pull unrelated bytes from the file into the segment, over-
-           writing the GMEM_ZEROINIT-cleared memory (which crashed e.g.
-           Borland's pstream::types BSS segment -> Interrupt 0D #GP). */
-        if (pSeg->size || !pSeg->minsize)
-        {
-            if (!NE_READ_DATA( pModule, mem, pos, size ))
-                return FALSE;
-            pos += size;
-        }
+        if (!NE_READ_DATA( pModule, mem, pos, size ))
+            return FALSE;
+        pos += size;
     }
     else
     {
@@ -1093,8 +1085,6 @@ BOOL NE_CreateSegment( NE_MODULE *pModule, int segnum, WORD sel )
                 }
             }
             minsize += pModule->ne_heap;
-            if (minsize >= 0x10000)
-                minsize = 0x10000;
         }
     }
     else
@@ -1104,6 +1094,10 @@ BOOL NE_CreateSegment( NE_MODULE *pModule, int segnum, WORD sel )
     if (pSeg->flags & NE_SEGFLAGS_32BIT) selflags |= WINE_LDT_FLAGS_32BIT;
     if (pModule->ne_expver < 0x300 && !(pModule->ne_flags & NE_FFLAGS_BUILTIN))
         selflags &= ~WINE_LDT_FLAGS_32BIT;
+    /* 16-bit NE segments are one selector. minalloc 65535 plus wine's +2
+     * must not become a huge tiled block (that broke ASDE far pointers). */
+    if (!(selflags & WINE_LDT_FLAGS_32BIT) && (unsigned int)minsize > 0x10000)
+        minsize = 0x10000;
     pSeg->hSeg = GLOBAL_Alloc( NE_Ne2MemFlags(pSeg->flags), minsize, pModule->self, selflags, sel ? sel : AllocSelector16(0) );
     GLOBAL_SetSeg(pSeg->hSeg, segnum, (pSeg->flags & NE_SEGFLAGS_DATA) ? 2 : 3);
     if (!pSeg->hSeg) return FALSE;

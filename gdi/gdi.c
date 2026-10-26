@@ -131,21 +131,12 @@ static COLORREF convert_colorref(COLORREF color)
 static void set_dib_colors(HDC hdc)
 {
     PALETTEENTRY pal[256] = {0};
-    PALETTEENTRY syspal[20];
     GetPaletteEntries(GetCurrentObject(hdc, OBJ_PAL), 0, 256, &pal);
-    GetSystemPaletteEntries(hdc, 0, 10, &syspal);
-    GetSystemPaletteEntries(hdc, 246, 255, &syspal[10]);
     for (int i = 0; i < 256; i++)
     {
-        PALETTEENTRY entry = pal[i];
-        if (entry.peFlags == PC_EXPLICIT)
-        {
-            int idx = entry.peRed;
-            if ((idx < 10) || (idx >= 246)) entry = syspal[idx < 10 ? idx : idx - 236];
-        }
-        pal[i].peBlue = entry.peRed;
-        pal[i].peGreen = entry.peGreen;
-        pal[i].peRed = entry.peBlue;
+        BYTE tmp = pal[i].peRed;
+        pal[i].peRed = pal[i].peBlue;
+        pal[i].peBlue = tmp;
     }
     SetDIBColorTable(hdc, 0, 256, &pal);
 }

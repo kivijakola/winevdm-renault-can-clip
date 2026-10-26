@@ -36,6 +36,7 @@
 #include "winternl.h"
 #include "wine/winbase16.h"
 #include "kernel16_private.h"
+#include "wine/library.h"
 #include "wine/unicode.h"
 #include "wine/debug.h"
 
@@ -303,15 +304,6 @@ void FILE_CloseAll()
             CloseHandle(dos_handles[i]);
     }
     HeapFree(GetProcessHeap(), 0, dos_handles);
-}
-
-BOOL is_cdrom_file(LPCSTR name)
-{
-    char path[MAX_PATH];
-    if(!GetFullPathNameA(name, MAX_PATH, &path, NULL))
-        return FALSE;
-    path[3] = 0;
-    return GetDriveTypeA(path) == DRIVE_CDROM;
 }
 
 /***********************************************************************
@@ -978,14 +970,10 @@ LONG WINAPI _llseek16( HFILE16 hFile, LONG lOffset, INT16 nOrigin )
  */
 HFILE16 WINAPI _lopen16( LPCSTR path, INT16 mode )
 {
-    HFILE fh;
     CHAR buf[MAX_PATH];
     path = RedirectSystemDir(path, buf, MAX_PATH);
     path = RedirectDriveRoot(path, buf, MAX_PATH, FALSE);
-    fh =_lopen(path, mode);
-    if((fh == INVALID_HANDLE_VALUE) && (GetLastError() == ERROR_ACCESS_DENIED) && is_cdrom_file(path))
-        fh = _lopen(path, OF_READ);
-    return Win32HandleToDosFileHandle((HANDLE)fh);
+    return Win32HandleToDosFileHandle( (HANDLE)_lopen( path, mode ) );
 }
 
 
@@ -1432,6 +1420,38 @@ struct ini_redirect_data ini_redirect_list[] =
     {"win.ini", "mci extensions", NULL, NULL, NULL, NULL, TRUE},
 };
 
+static int profile_interesting(LPCSTR section, LPCSTR entry, LPCSTR filename)
+{
+    if (section && (strstr(section, "PERIPH") || !_stricmp(section, "CARTE_MESURE")))
+        return 1;
+    if (entry && (strstr(entry, "CARTE_MESURE") || strstr(entry, "TABPROTO")
+                  || strstr(entry, "PERIPH") || strstr(entry, "VOIE_COMM")))
+        return 1;
+    if (filename && (strstr(filename, "PRMCOMM") || strstr(filename, "5800HARD")))
+        return 1;
+    return 0;
+}
+
+static void profile16_log(LPCSTR op, LPCSTR section, LPCSTR entry, LPCSTR extra,
+                          LPCSTR filename, int ret)
+{
+    FILE *lf;
+    if (!profile_interesting(section, entry, filename)
+        && !(extra && strstr(extra, "PERIPH")))
+        return;
+    lf = fopen("C:\\ASDE\\profile16.log", "a");
+    if (!lf)
+        return;
+    fprintf(lf, "%s sec='%.40s' ent='%.40s' extra='%.80s' file='%.80s' ret=%d\n",
+            op,
+            section ? section : "",
+            entry ? entry : "",
+            extra ? extra : "",
+            filename ? filename : "",
+            ret);
+    fclose(lf);
+}
+
 /***********************************************************************
  *           GetPrivateProfileInt   (KERNEL.127)
  */
@@ -1457,7 +1477,11 @@ UINT16 WINAPI GetPrivateProfileInt16( LPCSTR section, LPCSTR entry,
         }
     }
     RedirectPrivateProfileStringWindowsDir(filename,ini);
-    return (INT16)GetPrivateProfileIntA(section,entry,def_val,ini);
+    {
+        INT16 n = (INT16)GetPrivateProfileIntA(section,entry,def_val,ini);
+        profile16_log("GPPI", section, entry, NULL, ini, n);
+        return n;
+    }
 }
 
 
@@ -1478,10 +1502,20 @@ const char *GetRedirectWindowsDir()
     {
         ERR("WINDIR %s is not a correct path.\n", windowsPath);
     }
+    {
+        char tmpdir[MAX_PATH];
+        PathCombineA(tmpdir, windowsPath, "temp");
+        CreateDirectoryA(tmpdir, NULL);
+    }
     return windowsPath;
 #else
     GetWindowsDirectoryA(windowsPath, sizeof(windowsPath));
     GetShortPathNameA(windowsPath, windowsPath, sizeof(windowsPath));
+    {
+        char tmpdir[MAX_PATH];
+        PathCombineA(tmpdir, windowsPath, "temp");
+        CreateDirectoryA(tmpdir, NULL);
+    }
     return windowsPath;
 #endif
 }
@@ -1543,6 +1577,73 @@ static int construct_redirected_ini_section(LPCSTR section, LPSTR data, UINT16 s
     }
     return buf_pos;
 }
+/* MFC 2.5 CStringData sits 8 bytes before GetBuffer(): nRefs, nDataLength,
+ * nAllocLength. GetBuffer() sets nRefs=-1 and NSDACQUI often skips
+ * ReleaseBuffer(); NTVDM still has the chars, but GetLength()/IsEmpty()
+ * stay 0 unless nDataLength is updated. nRefs 0/2 also occur. */
+static void sync_mfc_cstring(LPSTR buffer, UINT16 n)
+{
+    LONG nrefs;
+    UINT16 nlen, nalloc;
+    if (!buffer)
+        return;
+    memcpy(&nrefs, buffer - 8, sizeof nrefs);
+    memcpy(&nlen, buffer - 4, sizeof nlen);
+    memcpy(&nalloc, buffer - 2, sizeof nalloc);
+    if (nrefs != (LONG)-1 && nrefs != 0 && nrefs != 1 && nrefs != 2)
+        return;
+    if (nalloc < n || nalloc > 0x7FFE)
+        return;
+    if (nlen > nalloc)
+        return;
+    nlen = n;
+    memcpy(buffer - 4, &nlen, sizeof nlen);
+    buffer[n] = 0;
+}
+
+/* Win32 GetPrivateProfileStringA must not write into 16-bit DGROUP/CString
+ * memory. Copy through a host buffer, then into the mapped 16-bit dest. */
+static INT16 gpps_copy_to16(LPCSTR section, LPCSTR entry, LPCSTR def_val,
+                            LPSTR buffer, UINT16 len, LPCSTR filename)
+{
+    UINT16 n, copylen, room;
+    LPSTR tmp;
+
+    if (!len)
+        len = 0xFFFF;
+    if (!buffer)
+        return 0;
+    if (len == 1)
+    {
+        buffer[0] = 0;
+        return 0;
+    }
+    room = len;
+    tmp = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, room);
+    if (!tmp)
+        return 0;
+    n = (UINT16)GetPrivateProfileStringA(section, entry, def_val, tmp, room, filename);
+    copylen = n;
+    if (copylen >= room)
+        copylen = room - 1;
+    memcpy(buffer, tmp, copylen);
+    buffer[copylen] = 0;
+    HeapFree(GetProcessHeap(), 0, tmp);
+    sync_mfc_cstring(buffer, copylen);
+    if (section && !stricmp(section, "Communications"))
+    {
+        FILE *lf = fopen("C:\\ASDE\\profile16.log", "a");
+        if (lf)
+        {
+            fprintf(lf, "GPPS entry=%s file=%s n=%u val='%.80s'\n",
+                    entry ? entry : "", filename ? filename : "", copylen, buffer);
+            fclose(lf);
+        }
+    }
+    profile16_log("GPPS", section, entry, buffer, filename, copylen);
+    return copylen;
+}
+
 /***********************************************************************
  *           GetPrivateProfileString   (KERNEL.128)
  */
@@ -1591,7 +1692,11 @@ INT16 WINAPI GetPrivateProfileString16( LPCSTR section, LPCSTR entry,
                 size = min(strlen(val), len - 1);
                 memcpy(buffer, val, size);
                 buffer[size] = '\0';
-                return strlen(buffer);
+                {
+                    UINT16 n = (UINT16)strlen(buffer);
+                    sync_mfc_cstring(buffer, n);
+                    return n;
+                }
             }
         }
     }
@@ -1688,7 +1793,54 @@ INT16 WINAPI GetPrivateProfileString16( LPCSTR section, LPCSTR entry,
         }
         return 0;
     }
-    return GetPrivateProfileStringA( section, entry, def_val, buffer, len, filename );
+    return gpps_copy_to16( section, entry, def_val, buffer, len, filename );
+}
+
+INT16 WINAPI WIN16_GetPrivateProfileString( LPCSTR section, LPCSTR entry,
+                                            LPCSTR def_val, SEGPTR buffer16,
+                                            UINT16 len, LPCSTR filename )
+{
+    LPSTR buffer = MapSL( buffer16 );
+    INT16 n;
+    if (!buffer && buffer16)
+    {
+        if (!SELECTOROF(buffer16) && CURRENT_DS)
+            buffer = MapSL( MAKESEGPTR( CURRENT_DS, OFFSETOF(buffer16) ) );
+    }
+    n = GetPrivateProfileString16( section, entry, def_val, buffer, len, filename );
+    if (entry && strstr( entry, "Adr_Phys" ))
+    {
+        STACK16FRAME *fr = CURRENT_STACK16;
+        WORD sel = SELECTOROF( buffer16 );
+        WORD off = OFFSETOF( buffer16 );
+        FILE *lf = fopen( "C:\\ASDE\\dgroup16.log", "a" );
+        if (lf)
+        {
+            fprintf( lf, "GPPS %s n=%d buf16=%04X:%04X DS=%04X ret=%04X:%04X file='%s'\n",
+                     entry, n, sel, off, CURRENT_DS,
+                     fr ? fr->cs : 0, fr ? fr->ip : 0,
+                     filename ? filename : "" );
+            fclose( lf );
+        }
+    }
+    return n;
+}
+
+static void ensure_profile_parent(LPCSTR filename)
+{
+    char dir[MAX_PATH];
+    char *slash;
+    if (!filename || !filename[0])
+        return;
+    lstrcpynA(dir, filename, MAX_PATH);
+    slash = strrchr(dir, '\\');
+    if (!slash)
+        slash = strrchr(dir, '/');
+    if (!slash || slash == dir)
+        return;
+    *slash = 0;
+    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES)
+        CreateDirectoryA(dir, NULL);
 }
 
 static BOOL16 check_write_profile_error(LPCSTR filename, DWORD error)
@@ -1715,9 +1867,22 @@ BOOL16 WINAPI WritePrivateProfileString16( LPCSTR section, LPCSTR entry,
     char filenamebuf[MAX_PATH];
     RedirectPrivateProfileStringWindowsDir(filename, &filenamebuf);
     filename = filenamebuf;
+    ensure_profile_parent(filename);
     BOOL ret = WritePrivateProfileStringA(section,entry,string,filename);
+    DWORD err = ret ? 0 : GetLastError();
     if (!ret)
-        return check_write_profile_error(filename, GetLastError());
+        ret = check_write_profile_error(filename, err);
+    if (profile_interesting(section, entry, filename) || (string && strstr(string, "PERIPH")))
+    {
+        FILE *lf = fopen("C:\\ASDE\\profile16.log", "a");
+        if (lf)
+        {
+            fprintf(lf, "WPPS sec='%.40s' ent='%.40s' extra='%.80s' file='%.80s' ret=%d err=%lu\n",
+                    section ? section : "", entry ? entry : "", string ? string : "",
+                    filename ? filename : "", ret, (unsigned long)err);
+            fclose(lf);
+        }
+    }
     return ret;
 }
 

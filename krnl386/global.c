@@ -168,21 +168,23 @@ HGLOBAL16 GLOBAL_CreateBlock( WORD flags, void *ptr, DWORD size,
 
       /* Allocate the selector(s) */
 
+    selcount = size ? (WORD)((size + 0xffff) / 0x10000) : 1;
     if (sel)
     {
-        if (size > 65536)
-        {
-            ERR("prealloced sel must not be larger than 65536");
-            return 0;
-        }
+        WORD i;
         WORD descflags = selflags & 0x40 ? (selflags & ~0x40) | 0x4000 : selflags;
-        SELECTOR_ReallocBlock(sel, ptr, size);
-        SelectorAccessRights16(sel, 1, descflags);
+        /* 16-bit NE prealloc is one selector per segment; do not steal the next. */
+        if (!(selflags & WINE_LDT_FLAGS_32BIT) && size > 65536)
+            size = 65536;
+        selcount = size ? (WORD)((size + 0xffff) / 0x10000) : 1;
+        sel = SELECTOR_ReallocBlock(sel, ptr, size);
+        if (!sel) return 0;
+        for (i = 0; i < selcount; i++)
+            SelectorAccessRights16(sel + (i << __AHSHIFT), 1, descflags);
     }
     else
         sel = SELECTOR_AllocBlock( ptr, size, selflags );
     if (!sel) return 0;
-    selcount = (size + 0xffff) / 0x10000;
 
     if (!(pArena = GLOBAL_GetArena( sel, selcount )))
     {
@@ -272,14 +274,21 @@ HGLOBAL16 GLOBAL_Alloc( UINT16 flags, DWORD size, HGLOBAL16 hOwner, unsigned cha
 
     if (size == 0) return GLOBAL_CreateBlock( flags, NULL, 1, hOwner, selflags, sel );
 
-    /* Fixup the size */
-    DWORD fixup_size = (size < 0x10000) ? 0x1f : 0xfff; // selectors larger than 64k need page granularity
+    /* Fixup the size. 16-bit selectors stay in one 64KB tile; only 32-bit/huge
+     * blocks use 4KB granularity (which would round 65536 up to 69632). */
+    DWORD fixup_size;
+    if (!(selflags & WINE_LDT_FLAGS_32BIT) && size > 0x10000)
+        size = 0x10000;
+    fixup_size = (size <= 0x10000) ? 0x1f : 0xfff;
 
     if (size > GLOBAL_MAX_ALLOC_SIZE) return 0;
     size = (size + fixup_size) & ~fixup_size;
+    if (!(selflags & WINE_LDT_FLAGS_32BIT) && size > 0x10000)
+        size = 0x10000;
 
-    /* Allocate the linear memory */
-    ptr = HeapAlloc( get_win16_heap(), 0, size);
+    /* Allocate the linear memory. NTVDM commits zero pages; do the same so
+     * leftover far pointers are 0000:0000 (MFC jcxz) instead of #GP. */
+    ptr = HeapAlloc( get_win16_heap(), HEAP_ZERO_MEMORY, size);
       /* FIXME: free discardable blocks and try again? */
     if (!ptr) return 0;
 
@@ -292,13 +301,6 @@ HGLOBAL16 GLOBAL_Alloc( UINT16 flags, DWORD size, HGLOBAL16 hOwner, unsigned cha
         return 0;
     }
 
-    if (flags & GMEM_ZEROINIT) memset( ptr, 0, size );
-    else if (size > 100) // some programs depend on the block not being cleared also work around bug in procyan2
-    {
-        for (int i = 1; i < 22; i++)
-            ((char *)ptr)[size - i] = 0xff;
-    }
-    else ((char *)ptr)[size - 1] = 0xff;
     return handle;
 }
 WORD GLOBAL_GetSegNum(HGLOBAL16 hg)
@@ -491,10 +493,11 @@ HGLOBAL16 WINAPI GlobalReAlloc16(
 
 	if (ptr)
             newptr = HeapReAlloc( heap,
-		(pArena->pageLockCount > 0) ? HEAP_REALLOC_IN_PLACE_ONLY : 0, 
+		((pArena->pageLockCount > 0) ? HEAP_REALLOC_IN_PLACE_ONLY : 0)
+                | HEAP_ZERO_MEMORY,
                               ptr, size + add_size );
 	else
-            newptr = HeapAlloc( heap, 0, size + add_size );
+            newptr = HeapAlloc( heap, HEAP_ZERO_MEMORY, size + add_size );
 
     }
 
@@ -556,7 +559,8 @@ HGLOBAL16 WINAPI GlobalReAlloc16(
     if (selcount > 1)  /* clear the next arena blocks */
         memset( pNewArena + 1, 0, (selcount - 1) * sizeof(GLOBALARENA) );
 
-    if ((oldsize < size) && (flags & GMEM_ZEROINIT))
+    /* NTVDM grow of a 16-bit block is a newly committed (zero) page tail. */
+    if (oldsize < size)
         memset( (char *)ptr + oldsize, 0, size - oldsize );
     return !(pNewArena->handle ^ handle & ~1) ? handle : pNewArena->handle;
 }
@@ -1386,7 +1390,7 @@ void WINAPI DibMapGlobalMemory(WORD sel, void *base, DWORD size)
 void WINAPI DibUnmapGlobalMemory(void *base, DWORD size)
 {
     int i;
-    LPVOID heap = HeapAlloc(get_win16_heap(), 0, size);
+    LPVOID heap = HeapAlloc(get_win16_heap(), HEAP_ZERO_MEMORY, size);
     memcpy(heap, base, size);
     for (i = 0; i < globalArenaSize; i++)
     {

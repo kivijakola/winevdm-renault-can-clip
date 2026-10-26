@@ -652,7 +652,7 @@ HRESULT VARIANT_ClearInd(VARIANTARG16 *pVarg)
         SysFreeString16(*V_BSTRREF16(pVarg));
         break;
     case VT_VARIANT | VT_BYREF:
-        VariantClear16(MapSL(V_VARIANTREF(pVarg)));
+        VariantClear16(V_VARIANTREF(pVarg));
         break;
 #ifdef AVAIL_32BIT_VAR
     case VT_RECORD:

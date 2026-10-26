@@ -1,3 +1,23 @@
+# winevdm-renault-can-clip
+
+Fork of [otya128/winevdm](https://github.com/otya128/winevdm) with the patches needed to run Renault CLIP 16-bit **ASDE** (ISO / DgIpSvr) on 64-bit Windows.
+
+CLIP still starts ASDE as `wscript.exe c:\asde\asde.vbs initdbox 1`. On x64 there is no NTVDM, so the VBS must launch `otvdmw.exe` (see `clip/asde.vbs`). Build `otvdm`/`otvdmw` (MSYS2 MINGW32 cmake, or `build.ps1`) and keep 32-bit DgIpSvr / IsoDrv / VICnx plus ClipJcae64 for USB.
+
+ASDE-related emulator changes in this tree:
+
+- KERNEL profile: `GetPrivateProfileString` `-ret16` (DX=DS for MFC CString), MapSL from current DS, create redirected `WINDOWS\temp` so `WritePrivateProfileString` can write `PRMCOMM.TMP` (`PERIPH@xxxx` / `CARTE_MESURE`).
+- NE 64KB segment clamp (NTVDM-style), GlobalAlloc zeroed pages, LES / far-pointer and DF-clear on 16-bit call/return.
+- convspec: selector 0 is `MAKEINTRESOURCE(offset)` (LoadCursor `IDC_ARROW` is `0000:7F00`), not a NULL pointer.
+- USER: LoadImage/LoadCursor/SetCursor and class cursor fallbacks so the 16-bit mouse pointer stays visible.
+- WINSOCK 16-bit TCP for DGIPCLT → DgIpSvr (`127.0.0.1:8001`).
+- Optional HAXM/GVM/WHPX backends default **off** (`BUILD_HV_BACKENDS=OFF`); vm86 is enough.
+
+```bat
+cd C:\ASDE
+C:\path\to\build\otvdmw.exe ASDE.EXE INITDBOX 1
+```
+
 # winevdm on 64-bit Windows
 
 ![screenshot](screenshot.PNG)

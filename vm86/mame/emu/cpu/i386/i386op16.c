@@ -58,7 +58,6 @@ static UINT16 I386OP(shift_rotate16)(UINT8 modrm, UINT32 value, UINT8 shift)
 				break;
 		}
 	} else {
-		shift &= 31;
 		switch( (modrm >> 3) & 0x7 )
 		{
 			case 0:         /* ROL rm16, i8 */
@@ -115,18 +114,21 @@ static UINT16 I386OP(shift_rotate16)(UINT8 modrm, UINT32 value, UINT8 shift)
 				break;
 			case 4:         /* SHL/SAL rm16, i8 */
 			case 6:
+				shift &= 31;
 				dst = src << shift;
 				m_CF = (shift <= 16) && (src & (1 << (16-shift)));
 				SetSZPF16(dst);
 				CYCLES_RM(modrm, CYCLES_ROTATE_REG, CYCLES_ROTATE_MEM);
 				break;
 			case 5:         /* SHR rm16, i8 */
+				shift &= 31;
 				dst = src >> shift;
 				m_CF = (src & (1 << (shift-1))) ? 1 : 0;
 				SetSZPF16(dst);
 				CYCLES_RM(modrm, CYCLES_ROTATE_REG, CYCLES_ROTATE_MEM);
 				break;
 			case 7:         /* SAR rm16, i8 */
+				shift &= 31;
 				dst = (INT16)src >> shift;
 				m_CF = (src & (1 << (shift-1))) ? 1 : 0;
 				SetSZPF16(dst);
@@ -3762,7 +3764,7 @@ static bool I386OP(load_far_pointer16)(int s)
 		UINT32 ea = GetEA(modrm,0);
 		STORE_REG16(modrm, READ16(ea + 0));
 		selector = READ16(ea + 2);
-		i386_sreg_load(selector,s,NULL);
+		i386_sreg_load_les(selector,s);
 	}
 	return true;
 }

@@ -1052,8 +1052,11 @@ notify_done:
         LOCAL_ShrinkArena( ds, arena, size, FALSE );
     }
 
-    if (flags & LMEM_ZEROINIT)
-	memset((char *)pArena + ARENA_HEADER_SIZE, 0, pArena->next - arena - ARENA_HEADER_SIZE);
+    /* NTVDM carves the first local-heap blocks out of a zeroed DGROUP.
+     * wine reuses host HeapAlloc leftovers, so LMEM_FIXED without
+     * LMEM_ZEROINIT can leave count words like this+0x32A as 0x00FF and
+     * trip NSDACQUI's duplicate-address abort. Always zero the payload. */
+    memset((char *)pArena + ARENA_HEADER_SIZE, 0, pArena->next - arena - ARENA_HEADER_SIZE);
     return arena + ARENA_HEADER_SIZE;
 }
 
@@ -1419,7 +1422,6 @@ HLOCAL16 WINAPI LocalReAlloc16( HLOCAL16 handle, WORD size, UINT16 flags )
     {
 	TRACE("size increase, making new free block\n");
         LOCAL_GrowArenaUpward(ds, arena, nextarena - arena);
-        if (flags & LMEM_ZEROINIT)
         {
             char *oldend = (char *)pArena + ARENA_HEADER_SIZE + oldsize;
             char *newend = ptr + pArena->next;
@@ -2008,8 +2010,7 @@ DWORD WINAPI Local32Alloc16( HANDLE heap, DWORD size, INT16 type, DWORD flags )
     DWORD addr;
 
     /* Allocate memory */
-    ptr = HeapAlloc( header->heap,
-                     (flags & LMEM_MOVEABLE)? HEAP_ZERO_MEMORY : 0, size );
+    ptr = HeapAlloc( header->heap, HEAP_ZERO_MEMORY, size );
     if (!ptr) return 0;
 
 
@@ -2093,9 +2094,7 @@ DWORD WINAPI Local32ReAlloc16( HANDLE heap, DWORD addr, INT16 type,
     if (!handle) return FALSE;
 
     /* Reallocate memory block */
-    ptr = HeapReAlloc( header->heap,
-                       (flags & LMEM_MOVEABLE)? HEAP_ZERO_MEMORY : 0,
-                       ptr, size );
+    ptr = HeapReAlloc( header->heap, HEAP_ZERO_MEMORY, ptr, size );
     if (!ptr) return 0;
 
     /* Modify handle */

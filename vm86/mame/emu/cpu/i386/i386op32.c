@@ -2121,7 +2121,7 @@ static void I386OP(sub_r32_rm32)()      // Opcode 0x2b
 		STORE_REG32(modrm, dst);
 		CYCLES(CYCLES_ALU_REG_REG);
 	} else {
-		UINT32 ea = GetEA(modrm,0);
+		UINT32 ea = GetEA(modrm,1);
 		src = READ32(ea);
 		dst = LOAD_REG32(modrm);
 		dst = SUB32(dst, src);

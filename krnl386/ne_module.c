@@ -1707,9 +1707,6 @@ BOOL16 WINAPI FreeModule16( HMODULE16 hModule )
 DWORD WINAPI WIN16_FreeLibrary16(HINSTANCE16 handle)
 {
     FreeLibrary16(handle);
-    if (IsBadReadPtr16(CURRENT_STACK16->es << 16, 1)) CURRENT_STACK16->es = 0;
-    if (IsBadReadPtr16(CURRENT_STACK16->fs << 16, 1)) CURRENT_STACK16->fs = 0;
-    if (IsBadReadPtr16(CURRENT_STACK16->gs << 16, 1)) CURRENT_STACK16->gs = 0;
     return MAKELONG(0, CURRENT_STACK16->cs);
 }
 

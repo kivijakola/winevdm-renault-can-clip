@@ -129,7 +129,7 @@
 125 pascal -ret16 DisableKernel() KERNEL_nop
 126 stub MemoryFreed
 127 pascal -ret16 GetPrivateProfileInt(str str s_word str) GetPrivateProfileInt16
-128 pascal -ret16 GetPrivateProfileString(str str str ptr word str) GetPrivateProfileString16
+128 pascal -ret16 GetPrivateProfileString(str str str segptr word str) WIN16_GetPrivateProfileString
 129 pascal -ret16 WritePrivateProfileString(str str str str) WritePrivateProfileString16
 130 pascal FileCDR(ptr) FileCDR16
 131 pascal GetDOSEnvironment() GetDOSEnvironment16
@@ -712,7 +712,6 @@
 @ stdcall -arch=win32 GlobalReAlloc16(long long long)
 @ stdcall -arch=win32 InitTask16(ptr)
 @ stdcall -arch=win32 IsBadReadPtr16(long long)
-@ stdcall -arch=win32 IsBadCodePtr16(long)
 @ stdcall -arch=win32 IsTask16(long)
 @ stdcall -arch=win32 LoadModule16(str ptr)
 @ stdcall -arch=win32 LoadResource16(long long)

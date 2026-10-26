@@ -52,12 +52,20 @@ static inline void add_stack( CONTEXT *context, int offset )
         context->Esp += offset;
 }
 
+static inline int is_host_flat_sel( WORD sel, int long_addr )
+{
+    if (!(sel & ~3)) return 0;
+    if (!(sel & 4)) return (sel >> 3) < WINE_HOST_GDT_INDEX_MAX;
+    /* Reserved LDT is 32-bit wine CS only, not a 16-bit SEGPTR. */
+    return long_addr && wine_ldt_is_system( sel );
+}
+
 static inline void *make_ptr( CONTEXT *context, DWORD seg, DWORD off, int long_addr )
 {
     if (ISV86(context)) return (void *)((seg << 4) + LOWORD(off));
-    if (wine_ldt_is_system(seg)) return (void *)off;
     if (!long_addr) off = LOWORD(off);
-    return (char *) MapSL( MAKESEGPTR( seg, 0 ) ) + off;
+    if (is_host_flat_sel( (WORD)seg, long_addr )) return (void *)off;
+    return wine_ldt_get_ptr( (WORD)seg, off );
 }
 
 static inline void *get_stack( CONTEXT *context )
@@ -318,8 +326,9 @@ static BYTE *INSTR_GetOperandAddr( CONTEXT *context, BYTE *instr,
     if (segprefix != -1) seg = segprefix;
 
     /* Make sure the segment and offset are valid */
-    if (wine_ldt_is_system(seg)) return (BYTE *)(base + (index << ss));
-    if ((seg & 7) != 7) return NULL;
+    if (is_host_flat_sel( (WORD)seg, long_addr )) return (BYTE *)(base + (index << ss));
+    /* LDT only; RPL need not be 3 (old check was (seg & 7) != 7). */
+    if (!(seg & 4) || !(seg & ~7)) return NULL;
     wine_ldt_get_entry( seg, &entry );
     if (wine_ldt_is_empty( &entry )) return NULL;
     if (wine_ldt_get_limit(&entry) < (base + (index << ss))) return NULL;
@@ -344,8 +353,25 @@ static BOOL INSTR_EmulateLDS( CONTEXT *context, BYTE *instr, int long_op,
         return FALSE;  /* Unable to emulate it */
     seg = *(WORD *)(addr + (long_op ? 4 : 2));
 
-    if (!INSTR_ReplaceSelector( context, &seg ))
-        return FALSE;  /* Unable to emulate it */
+    /* 0x40 is the bimodal BIOS selector. Any other GDT selector still
+     * cannot be recovered here, but a present LDT selector must be
+     * loaded — MAME/vm86 sometimes #GPs a legal LES/LDS and used to
+     * retry the same instruction forever because only 0x40 was accepted.
+     */
+    if (seg == 0x40)
+    {
+        DOSVM_start_bios_timer();
+        seg = DOSMEM_BiosDataSeg;
+    }
+    else if (seg & ~3)
+    {
+        LDT_ENTRY entry;
+        if (!(seg & 4))
+            return FALSE;
+        wine_ldt_get_entry( seg, &entry );
+        if (wine_ldt_is_empty( &entry ))
+            return FALSE;
+    }
 
     /* Now store the offset in the correct register */
 

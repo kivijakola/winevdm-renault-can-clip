@@ -112,6 +112,10 @@ __declspec(dllimport) struct __wine_ldt_copy
 #define WINE_LDT_FLAGS_TYPE_MASK 0x1f  /* Mask for segment type */
 #define WINE_LDT_FLAGS_32BIT     0x40  /* Segment is 32-bit (code or stack) */
 #define WINE_LDT_FLAGS_ALLOCATED 0x80  /* Segment is allocated (no longer free) */
+/* NT user GDT is 0x08/0x1B/0x23/0x3B (index < 16). 0x0172 is a Win16
+ * handle-shaped value; treating it as GDT returned (void*)offset (00000A9C). */
+#define WINE_HOST_GDT_INDEX_MAX  16
+#define WINE_LDT_FIRST_ENTRY     512
 
 /* helper functions to manipulate the LDT_ENTRY structure */
 static inline void wine_ldt_set_base( LDT_ENTRY *ent, const void *base )

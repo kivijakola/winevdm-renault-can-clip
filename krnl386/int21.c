@@ -2091,7 +2091,6 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
     HANDLE   handle;
     BOOL     status;
     FILETIME filetime;
-    FILETIME filetime2;
     DWORD    result;
     WORD     date, time;
     int      len;
@@ -2160,8 +2159,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             DosDateTimeToFileTime( DI_reg(context), 
                                    CX_reg(context),
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            status = SetFileTime( handle, NULL, NULL, &filetime2 );
+            status = SetFileTime( handle, NULL, NULL, &filetime );
 
             CloseHandle( handle );
             return status;
@@ -2185,8 +2183,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             status = GetFileTime( handle, NULL, NULL, &filetime );
             if (status)
             {
-                FileTimeToLocalFileTime(&filetime, &filetime2);
-                FileTimeToDosDateTime( &filetime2, &date, &time );
+                FileTimeToDosDateTime( &filetime, &date, &time );
                 SET_DI( context, date );
                 SET_CX( context, time );
             }
@@ -2213,8 +2210,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             DosDateTimeToFileTime( DI_reg(context), 
                                    0,
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            status = SetFileTime( handle, NULL, &filetime2, NULL );
+            status = SetFileTime( handle, NULL, &filetime, NULL );
 
             CloseHandle( handle );
             return status;
@@ -2238,8 +2234,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             status = GetFileTime( handle, NULL, &filetime, NULL );
             if (status)
             {
-                FileTimeToLocalFileTime(&filetime, &filetime2);
-                FileTimeToDosDateTime( &filetime2, &date, NULL );
+                FileTimeToDosDateTime( &filetime, &date, NULL );
                 SET_DI( context, date );
             }
 
@@ -2268,8 +2263,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             DosDateTimeToFileTime( DI_reg(context),
                                    CX_reg(context),
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            status = SetFileTime( handle, &filetime2, NULL, NULL );
+            status = SetFileTime( handle, &filetime, NULL, NULL );
 
             CloseHandle( handle );
             return status;
@@ -2293,8 +2287,7 @@ static BOOL INT21_FileAttributes( CONTEXT *context,
             status = GetFileTime( handle, &filetime, NULL, NULL );
             if (status)
             {            
-                FileTimeToLocalFileTime(&filetime, &filetime2);
-                FileTimeToDosDateTime( &filetime2, &date, &time );
+                FileTimeToDosDateTime( &filetime, &date, &time );
                 SET_DI( context, date );
                 SET_CX( context, time );
                 /*
@@ -2349,7 +2342,6 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
 {
     HANDLE   handle = DosFileHandleToWin32Handle(BX_reg(context));
     FILETIME filetime;
-    FILETIME filetime2;
     WORD     date, time;
 
     switch (AL_reg(context)) {
@@ -2359,8 +2351,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
         {
             if (!GetFileTime( handle, NULL, NULL, &filetime ))
                 return FALSE;
-            FileTimeToLocalFileTime(&filetime, &filetime2);
-            FileTimeToDosDateTime( &filetime2, &date, &time );
+            FileTimeToDosDateTime( &filetime, &date, &time );
             SET_DX( context, date );
             SET_CX( context, time );
             break;
@@ -2380,8 +2371,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
             DosDateTimeToFileTime( DX_reg(context), 
                                    CX_reg(context),
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            if (!SetFileTime( handle, NULL, NULL, &filetime2 ))
+            if (!SetFileTime( handle, NULL, NULL, &filetime ))
                 return FALSE;
             break;
         }
@@ -2392,8 +2382,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
         {
             if (!GetFileTime( handle, NULL, &filetime, NULL ))
                 return FALSE;
-            FileTimeToLocalFileTime(&filetime, &filetime2);
-            FileTimeToDosDateTime( &filetime2, &date, &time );
+            FileTimeToDosDateTime( &filetime, &date, &time );
             SET_DX( context, date );
             SET_CX( context, time );
             break;
@@ -2406,8 +2395,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
             DosDateTimeToFileTime( DX_reg(context), 
                                    CX_reg(context),
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            if (!SetFileTime( handle, NULL, &filetime2, NULL ))
+            if (!SetFileTime( handle, NULL, &filetime, NULL ))
                 return FALSE;
             break;
         }
@@ -2418,8 +2406,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
         {
             if (!GetFileTime( handle, &filetime, NULL, NULL ))
                 return FALSE;
-            FileTimeToLocalFileTime(&filetime, &filetime2);
-            FileTimeToDosDateTime( &filetime2, &date, &time );
+            FileTimeToDosDateTime( &filetime, &date, &time );
             SET_DX( context, date );
             SET_CX( context, time );
             /*
@@ -2439,8 +2426,7 @@ static BOOL INT21_FileDateTime( CONTEXT *context )
             DosDateTimeToFileTime( DX_reg(context), 
                                    CX_reg(context),
                                    &filetime );
-            LocalFileTimeToFileTime(&filetime, &filetime2);
-            if (!SetFileTime( handle, &filetime2, NULL, NULL ))
+            if (!SetFileTime( handle, &filetime, NULL, NULL ))
                 return FALSE;
             break;
         }
@@ -3979,7 +3965,7 @@ static unsigned INT21_FindHelper(LPCWSTR fullPath, unsigned drive, unsigned coun
         if (count) return 0;
         path[0] = drive + 'A';
         volname[0] = '\0';
-        memset(entry->cAlternateFileName, 0, 14 * sizeof(WCHAR));
+        entry->cAlternateFileName[0] = '\0';
         if (!GetVolumeInformationW(path, volname, MAX_PATH, NULL, NULL, NULL, NULL, 0)) return 0;
         if (!volname[0]) return 0;
         RtlSecondsSince1970ToTime( 0, (LARGE_INTEGER *)&entry->ftCreationTime );

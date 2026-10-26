@@ -898,9 +898,7 @@ BOOL16 WINAPI DestroyWindow16( HWND16 hwnd )
 {
     DWORD count;
     BOOL result;
-    HMENU16 hmenu16 = NULL;
-    HWND hwnd32 = HWND_32(hwnd);
-    if(!GetMenu(hwnd32)) hmenu16 = GetMenu16(hwnd);
+    HMENU16 hmenu16 = GetMenu16(hwnd);
     ReleaseThunkLock(&count);
     result = DestroyWindow(WIN_Handle32(hwnd));
     RestoreThunkLock(count);
@@ -2622,6 +2620,8 @@ ATOM WINAPI RegisterClassEx16( const WNDCLASSEX16 *wc )
     wc32.hInstance     = HINSTANCE_32(inst);
     wc32.hIcon         = get_icon_32(wc->hIcon);
     wc32.hCursor       = get_icon_32( wc->hCursor );
+    if (!wc32.hCursor)
+        wc32.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc32.hbrBackground = HBRUSH_32(wc->hbrBackground);
     wc32.lpszMenuName  = MapSL(wc->lpszMenuName);
     wc32.lpszClassName = classname32;

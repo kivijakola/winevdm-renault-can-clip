@@ -690,7 +690,8 @@ extern "C"
 		i386_load_segment_descriptor(GS);
 		i386_jmp_far(SREG(CS), context->Eip);
         m_eip = context->Eip;
-		set_flags(context->EFlags);
+        /* NTVDM: DF is clear after a 16-bit KERNEL call. */
+		set_flags(context->EFlags & ~0x400);
 	}
 	unsigned char table[256 * 4 + 2 + 0x8 * 256] = { 0xcf };
 	unsigned char iret[256] = { 0xcf };
@@ -1477,6 +1478,122 @@ try_again:
         RaiseException(0x80000110 /* EXCEPTION_VM86_INTx */, 0, sizeof(exception_args) / sizeof(ULONG), (ULONG_PTR*)exception_args);
         load_context(&vcontext);
     }
+	static void nsd_hex_far(FILE *lf, const char *tag, WORD sel, WORD off, int n)
+	{
+		int i;
+		unsigned char *p = (sel && (sel & 4)) ? (unsigned char *)wine_ldt_get_ptr(sel, off) : 0;
+		fprintf(lf, "  %s %04X:%04X=", tag, sel, off);
+		if (!p)
+		{
+			fprintf(lf, "null\n");
+			return;
+		}
+		for (i = 0; i < n; i++)
+			fprintf(lf, "%02X ", p[i]);
+		fprintf(lf, " '");
+		for (i = 0; i < n; i++)
+		{
+			unsigned char c = p[i];
+			fputc((c >= 32 && c < 127) ? c : '.', lf);
+		}
+		fprintf(lf, "'\n");
+	}
+
+	static unsigned char *nsd_ds(WORD off)
+	{
+		if (!(SREG(DS) & 4) || !m_sreg[DS].valid)
+			return 0;
+		return (unsigned char *)(ULONG_PTR)SREG_BASE(DS) + off;
+	}
+
+	static int nsd_has_deport(void)
+	{
+		unsigned char *p = nsd_ds(0x652C);
+		if (!p)
+			return 0;
+		return p[0] == '5' && p[1] == '1' && p[2] == ':';
+	}
+
+	static void nsd_hex_ds(FILE *lf, const char *tag, WORD off, int n)
+	{
+		unsigned char *p = nsd_ds(off);
+		int i;
+		fprintf(lf, "  %s DS:%04X=", tag, off);
+		if (!p)
+		{
+			fprintf(lf, "null\n");
+			return;
+		}
+		for (i = 0; i < n; i++)
+			fprintf(lf, "%02X ", p[i]);
+		fprintf(lf, " '");
+		for (i = 0; i < n; i++)
+		{
+			unsigned char c = p[i];
+			fputc((c >= 32 && c < 127) ? c : '.', lf);
+		}
+		fprintf(lf, "'\n");
+	}
+
+	/* NSDACQUI seg3 Adr_Phys_Deport after KERNEL.128 */
+	static void dump_nsd_parse(WORD ip)
+	{
+		FILE *lf;
+		WORD *stk;
+		int deport = nsd_has_deport();
+		if (!deport)
+			return;
+		stk = (WORD *)((unsigned char *)(ULONG_PTR)SREG_BASE(SS) + REG16(SP));
+		lf = fopen("C:\\ASDE\\dgroup16.log", "a");
+		if (!lf)
+			return;
+		fprintf(lf, "NSD CS:IP=%04X:%04X AX=%04X DX=%04X BX=%04X DS=%04X ES=%04X ESbase=%08X ESlimit=%08X ESflags=%04X ESvalid=%d DF=%d [6680]=%04X [6686]=%04X\n",
+			SREG(CS), ip, REG16(AX), REG16(DX), REG16(BX), SREG(DS), SREG(ES),
+			(unsigned)SREG_BASE(ES), (unsigned)m_sreg[ES].limit, m_sreg[ES].flags,
+			m_sreg[ES].valid ? 1 : 0, m_DF,
+			nsd_ds(0x6680) ? *(WORD *)nsd_ds(0x6680) : 0xFFFF,
+			nsd_ds(0x6686) ? *(WORD *)nsd_ds(0x6686) : 0xFFFF);
+		{
+			WORD *fr = (WORD *)((unsigned char *)(ULONG_PTR)SREG_BASE(SS) + REG16(BP));
+			if (fr)
+			{
+				WORD this_off = fr[3]; /* bp+6 */
+				WORD this_sel = fr[4]; /* bp+8 */
+				unsigned char *obj = 0;
+				if (this_sel & 4)
+					obj = (unsigned char *)(ULONG_PTR)wine_ldt_get_ptr(this_sel, this_off);
+				fprintf(lf, "  this=%04X:%04X count32A=%04X rec0addr=%02X ESlimit=%08X ESflags=%04X\n",
+					this_sel, this_off,
+					obj ? *(WORD *)(obj + 0x32A) : 0xFFFF,
+					obj ? obj[0x1E] : 0xFF,
+					(unsigned)m_sreg[ES].limit, m_sreg[ES].flags);
+			}
+		}
+		if (stk)
+			fprintf(lf, "  stack ret=%04X:%04X a0=%04X a1=%04X a2=%04X\n",
+				stk[1], stk[0], stk[2], stk[3], stk[4]);
+		if (ip == 0x7CE8 && stk)
+		{
+			fprintf(lf, "  strchr arg=%04X:%04X ch=%04X\n", stk[3], stk[2], stk[4]);
+			nsd_hex_far(lf, "arg", stk[3], stk[2], 40);
+		}
+		if (ip == 0xA54C)
+			fprintf(lf, "  strchr ret DX:AX=%04X:%04X\n", REG16(DX), REG16(AX));
+		if (ip == 0xA581 || ip == 0xA69C)
+			fprintf(lf, "  sscanf ret AX=%04X\n", REG16(AX));
+		nsd_hex_ds(lf, "652C", 0x652C, 40);
+		{
+			unsigned char *p662c = nsd_ds(0x662C);
+			if (p662c)
+			{
+				WORD off = *(WORD *)p662c;
+				WORD sel = *(WORD *)(p662c + 2);
+				fprintf(lf, "  662C far=%04X:%04X\n", sel, off);
+			}
+		}
+		fclose(lf);
+	}
+
 	void vm86main(CONTEXT *context, DWORD cbArgs, PEXCEPTION_HANDLER handler,
 		void(*from16_reg)(void),
 		LONG(*__wine_call_from_16)(void),
@@ -1763,7 +1880,9 @@ try_again:
                             REG16(BP) = bp;
                         }
                         SREG(CS) = (WORD)context.SegCs;
-                        set_flags(context.EFlags);
+                        /* NTVDM: DF=0 after 16-bit KERNEL return (strchr/sscanf have no CLD). */
+                        set_flags(context.EFlags & ~0x400);
+                        m_DF = 0;
 						i386_load_segment_descriptor(ES);
 						i386_load_segment_descriptor(SS);
 						i386_load_segment_descriptor(DS);

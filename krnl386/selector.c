@@ -242,6 +242,7 @@ WORD WINAPI AllocDStoCSAlias16( WORD sel )
     if (!newsel) return 0;
     wine_ldt_get_entry( sel, &entry );
     entry.HighWord.Bits.Type = WINE_LDT_FLAGS_CODE;
+    entry.HighWord.Bits.Default_Big = 0;
     if (wine_ldt_set_entry( newsel, &entry ) >= 0) return newsel;
     wine_ldt_free_entries( newsel, 1 );
     return 0;
@@ -532,8 +533,27 @@ void WINAPI UnMapLS( SEGPTR sptr )
  */
 LPVOID WINAPI MapSL( SEGPTR sptr )
 {
-    if (!(SELECTOROF(sptr) & 4)) return OFFSETOF(sptr);
-    return (char *)wine_ldt_copy.base[SELECTOROF(sptr) >> __AHSHIFT] + OFFSETOF(sptr);
+    WORD sel = SELECTOROF(sptr);
+    unsigned long off = OFFSETOF(sptr);
+    int index = sel >> __AHSHIFT;
+
+    /* Do not use wine_ldt_get_ptr here: it treats reserved LDT (<512) and
+     * small GDT as (void*)offset, which is 00000A9A/00000A9C. */
+    if (!(sel & ~3))
+        return NULL;
+    if (!(sel & 4))
+    {
+        if (index < WINE_HOST_GDT_INDEX_MAX)
+            return (void *)(ULONG_PTR)off;
+        return NULL;
+    }
+    if (index < WINE_LDT_FIRST_ENTRY || index >= 8192)
+        return NULL;
+    if (!(wine_ldt_copy.flags[index] & WINE_LDT_FLAGS_ALLOCATED) || !wine_ldt_copy.base[index])
+        return NULL;
+    if (!(wine_ldt_copy.flags[index] & WINE_LDT_FLAGS_32BIT))
+        off &= 0xffff;
+    return (char *)wine_ldt_copy.base[index] + off;
 }
 
 /***********************************************************************

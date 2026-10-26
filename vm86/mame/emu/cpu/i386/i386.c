@@ -601,6 +601,17 @@ static void i386_sreg_load(UINT16 selector, UINT8 reg, bool *fault)
 	if(fault) *fault = false;
 }
 
+/* Microsoft C 16-bit sscanf/strchr use LES/LDS of far pointers. NTVDM
+ * (286) loads any present LDT selector; MAME's 386 RPL/DPL checks #GP
+ * and otvdm then skips the instruction, so ES/DS stay wrong. */
+static void i386_sreg_load_les(UINT16 selector, UINT8 reg)
+{
+	m_sreg[reg].selector = selector;
+	i386_load_segment_descriptor(reg);
+	if (selector & ~3)
+		m_sreg[reg].valid = true;
+}
+
 static void i386_trap(int irq, int irq_gate, int trap_level)
 {
 	/*  I386 Interrupts/Traps/Faults:
