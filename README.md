@@ -10,7 +10,7 @@ ASDE-related emulator changes in this tree:
 - NE 64KB segment clamp (NTVDM-style), GlobalAlloc zeroed pages, LES / far-pointer and DF-clear on 16-bit call/return.
 - convspec: selector 0 is `MAKEINTRESOURCE(offset)` (LoadCursor `IDC_ARROW` is `0000:7F00`), not a NULL pointer.
 - USER: LoadImage/LoadCursor/SetCursor and class cursor fallbacks so the 16-bit mouse pointer stays visible.
-- WINSOCK 16-bit TCP for DGIPCLT → DgIpSvr (`127.0.0.1:8001`): keep sockets blocking, return one DGIP frame per recv, one-shot FD_CLOSE on FIN, and do not post FD_READ from inside recv.
+- WINSOCK 16-bit TCP for DGIPCLT → DgIpSvr (`127.0.0.1:8001`): NTVDM-style `WSAAsyncSelect` (WORD socket, posted `FD_CONNECT`/`FD_READ`/`FD_CLOSE`, no `FD_WRITE` storm), one DGIP frame per recv, one-shot `FD_CLOSE` on FIN, and serialize a nested page-change send so LIST OF PARAMETERS arrows do not steal an in-flight `21 xx` reply. Enable `WS16_LOG` in `winsock/socket.c` for `C:\ASDE\ws16.log`.
 - Optional HAXM/GVM/WHPX backends default **off** (`BUILD_HV_BACKENDS=OFF`); vm86 is enough.
 
 ```bat

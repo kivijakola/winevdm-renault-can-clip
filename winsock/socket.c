@@ -27,8 +27,13 @@
 #include "wownt32.h"
 #include "winuser.h"
 #include "wine/debug.h"
+
+/* Define WS16_LOG to append C:\ASDE\ws16.log (connect/send/recv/FD_*). */
+/* #define WS16_LOG */
+#ifdef WS16_LOG
 #include <stdio.h>
 #include <stdarg.h>
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 
@@ -104,9 +109,21 @@ static WNDPROC ws16_oldproc;
 static BYTE ws16_read_posted[WS16_MAX];
 static BYTE ws16_term_pending[WS16_MAX];
 static BYTE ws16_close_posted[WS16_MAX];
+static BYTE ws16_conn_posted[WS16_MAX];
+static BYTE ws16_close_notif[WS16_MAX];
+static BYTE ws16_waiting_recv[WS16_MAX];
+static BYTE ws16_hold_defer[WS16_MAX];
+static BYTE ws16_unacked[WS16_MAX];
+static unsigned ws16_snd_need[WS16_MAX];
+static unsigned ws16_snd_got[WS16_MAX];
+static DWORD ws16_last_send_tick[WS16_MAX];
+static unsigned char ws16_hold[8192];
+static unsigned ws16_hold_len;
+static SOCKET16 ws16_hold_s;
 static volatile LONG ws16_poller_run;
 static HANDLE ws16_poller;
 static SOCKET16 socket32_to_16(SOCKET s);
+static void ws16_post_event(SOCKET16 s16, WORD ev, WORD err);
 static void ws16_log(const char *fmt, ...);
 
 static LRESULT CALLBACK ws16_sub_proc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -132,9 +149,45 @@ static void ws16_hook_hwnd(HWND16 h16)
     ws16_log("notify hwnd16=%04x hwnd32=%p (no subclass)", h16, h32);
 }
 
+#ifdef WS16_LOG
+static void ws16_log(const char *fmt, ...)
+{
+    static FILE *f;
+    va_list ap;
+    if (!f)
+        f = fopen("C:\\ASDE\\ws16.log", "a");
+    if (!f)
+        return;
+    fprintf(f, "%lu ", GetTickCount());
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
+#else
 static void ws16_log(const char *fmt, ...)
 {
     (void)fmt;
+}
+#endif
+
+static void ws16_post_event(SOCKET16 s16, WORD ev, WORD err)
+{
+    HWND16 h16;
+    UINT16 msg;
+    HWND h32;
+    BOOL ok;
+    if (!s16 || s16 >= WS16_MAX)
+        return;
+    h16 = ws16_async_hwnd[s16];
+    msg = ws16_async_msg[s16];
+    if (!h16 || !msg)
+        return;
+    h32 = HWND_32(h16);
+    ok = PostMessageA(h32, msg, s16, MAKELONG(ev, err));
+    ws16_log("post s16=%u ev=%u err=%u hwnd16=%04x hwnd32=%p iswin=%d ok=%d gle=%u",
+             s16, ev, err, h16, h32, h32 ? IsWindow(h32) : 0, ok, GetLastError());
 }
 
 static SOCKET16 map_socket32(SOCKET s)
@@ -179,6 +232,19 @@ static void free_socket16(SOCKET16 s16)
         ws16_read_posted[s16] = 0;
         ws16_term_pending[s16] = 0;
         ws16_close_posted[s16] = 0;
+        ws16_conn_posted[s16] = 0;
+        ws16_close_notif[s16] = 0;
+        ws16_waiting_recv[s16] = 0;
+        ws16_hold_defer[s16] = 0;
+        ws16_unacked[s16] = 0;
+        ws16_snd_need[s16] = 0;
+        ws16_snd_got[s16] = 0;
+        ws16_last_send_tick[s16] = 0;
+        if (ws16_hold_s == s16)
+        {
+            ws16_hold_s = 0;
+            ws16_hold_len = 0;
+        }
     }
 }
 
@@ -211,33 +277,110 @@ static int ws16_dgip_frame(SOCKET s32)
     return (int)framesz;
 }
 
+static int ws16_is_fin(SOCKET s32)
+{
+    fd_set rfds;
+    struct timeval tv;
+    u_long avail = 0;
+    FD_ZERO(&rfds);
+    FD_SET(s32, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    if (select(0, &rfds, NULL, NULL, &tv) <= 0)
+        return 0;
+    if (ioctlsocket(s32, FIONREAD, &avail) != 0)
+        return 0;
+    return avail == 0;
+}
+
+/* Pull one owed :8001 reply off the wire before a nested send (pagedown
+ * while EVI refresh is in flight). select() only — no 16-bit pump. */
+static int ws16_stash_reply(SOCKET16 s16, SOCKET s32)
+{
+    int spins;
+    if (ws16_hold_len && ws16_hold_s == s16)
+        return 1;
+    for (spins = 0; spins < 20; spins++)
+    {
+        int fr = ws16_dgip_frame(s32);
+        if (fr > 0)
+        {
+            int n = recv(s32, (char *)ws16_hold, fr, 0);
+            if (n > 0)
+            {
+                ws16_hold_len = (unsigned)n;
+                ws16_hold_s = s16;
+                ws16_log("stash s16=%u n=%d", s16, n);
+                return 1;
+            }
+            return 0;
+        }
+        if (ws16_is_fin(s32))
+            return 0;
+        {
+            fd_set rfds;
+            struct timeval tv;
+            FD_ZERO(&rfds);
+            FD_SET(s32, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 20000;
+            if (select(0, &rfds, NULL, NULL, &tv) < 0)
+                return 0;
+        }
+    }
+    ws16_log("stash s16=%u timeout", s16);
+    return 0;
+}
+
 static DWORD WINAPI ws16_poller_fn(LPVOID unused)
 {
     (void)unused;
     while (ws16_poller_run)
     {
         int i;
-        Sleep(15);
+        Sleep(50);
         for (i = 1; i < WS16_MAX; i++)
         {
             int fr;
+            SOCKET s32;
             if (!ws16_socks[i] || !ws16_async_hwnd[i] || !ws16_async_msg[i])
                 continue;
-            fr = ws16_dgip_frame(ws16_socks[i]);
+            s32 = ws16_socks[i];
+            /* NTVDM posts FD_CONNECT into the 16-bit queue. ws2_32 posts it
+             * to our 32-bit proxy, which this thread may never pump. */
+            if (!ws16_conn_posted[i])
+            {
+                struct sockaddr_in peer;
+                int peerlen = sizeof(peer);
+                int soerr = 0, solen = sizeof(soerr);
+                if (getpeername(s32, (struct sockaddr *)&peer, &peerlen) == 0)
+                {
+                    ws16_post_event((SOCKET16)i, FD_CONNECT, 0);
+                    ws16_conn_posted[i] = 1;
+                }
+                else if (getsockopt(s32, SOL_SOCKET, SO_ERROR, (char *)&soerr, &solen) == 0 && soerr)
+                {
+                    ws16_post_event((SOCKET16)i, FD_CONNECT, (WORD)soerr);
+                    ws16_conn_posted[i] = 1;
+                }
+            }
+            fr = ws16_dgip_frame(s32);
             if (fr <= 0)
             {
                 ws16_read_posted[i] = 0;
+                if (!ws16_close_notif[i] && ws16_is_fin(s32))
+                {
+                    ws16_post_event((SOCKET16)i, FD_CLOSE, 0);
+                    ws16_close_notif[i] = 1;
+                }
                 continue;
             }
-            /* Retry a missed FD_READ. A latched notify with the frame still
-             * buffered is how cold-start ident stops on WAIT CONNECTING. */
-            if (ws16_read_posted[i] && ws16_read_posted[i] < 12)
-            {
-                ws16_read_posted[i]++;
+            /* One FD_READ until recv. Reposting while the first is still
+             * queued makes a second recv see an empty socket and hang. */
+            if (ws16_read_posted[i])
                 continue;
-            }
-            if (PostMessageA(HWND_32(ws16_async_hwnd[i]), ws16_async_msg[i], i, MAKELONG(FD_READ, 0)))
-                ws16_read_posted[i] = 1;
+            ws16_post_event((SOCKET16)i, FD_READ, 0);
+            ws16_read_posted[i] = 1;
         }
     }
     return 0;
@@ -263,10 +406,33 @@ static LRESULT CALLBACK ws16_proxy_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                  s16 < WS16_MAX ? ws16_async_msg[s16] : 0);
         if (s16 && s16 < WS16_MAX && ws16_async_msg[s16] && ws16_async_hwnd[s16])
         {
-            HWND h32 = HWND_32(ws16_async_hwnd[s16]);
-            BOOL ok = PostMessageA(h32, ws16_async_msg[s16], s16, lp);
-            ws16_log("post hwnd16=%04x hwnd32=%p ok=%d",
-                     ws16_async_hwnd[s16], h32, ok);
+            /* Win32 FD_WRITE is level-triggered and livelocks 16-bit
+             * CSocket::PumpMessages (black screen, 100% CPU). NTVDM
+             * posts it once with connect; we already send after FD_CONNECT. */
+            if (ev == FD_WRITE || ev == FD_OOB)
+                return 0;
+            if (ev == FD_CONNECT)
+            {
+                if (ws16_conn_posted[s16])
+                    return 0;
+                ws16_conn_posted[s16] = 1;
+            }
+            if (ev == FD_READ)
+            {
+                int fr = ws16_dgip_frame(ws16_socks[s16]);
+                if (fr == 0)
+                    return 0;
+                if (ws16_read_posted[s16])
+                    return 0;
+                ws16_read_posted[s16] = 1;
+            }
+            if (ev == FD_CLOSE)
+            {
+                if (ws16_close_notif[s16])
+                    return 0;
+                ws16_close_notif[s16] = 1;
+            }
+            ws16_post_event(s16, ev, err);
         }
         return 0;
     }
@@ -283,11 +449,9 @@ static HWND ws16_get_proxy(void)
     wc.hInstance = GetModuleHandleA(NULL);
     wc.lpszClassName = "WS16AsyncProxy";
     RegisterClassA(&wc);
+    /* HWND_MESSAGE is often not pumped while otvdm is in the 16-bit loop. */
     ws16_proxy_hwnd = CreateWindowA("WS16AsyncProxy", "", WS_OVERLAPPED,
-                                    0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
-    if (!ws16_proxy_hwnd)
-        ws16_proxy_hwnd = CreateWindowA("WS16AsyncProxy", "", WS_OVERLAPPED,
-                                        0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+                                    0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
     ws16_log("proxy hwnd=%p err=%u", ws16_proxy_hwnd, GetLastError());
     return ws16_proxy_hwnd;
 }
@@ -693,30 +857,23 @@ INT16 WINAPI closesocket16(SOCKET16 s)
 INT16 WINAPI connect16(SOCKET16 s, struct sockaddr *name, INT16 namelen)
 {
     SOCKET s32 = ws16_to_32(s);
-    struct sockaddr_in *in = (struct sockaddr_in *)name;
     INT16 ret;
-    unsigned port = 0, addr = 0;
-    u_long nb = 0;
-    if (name && namelen >= 8)
-    {
-        port = ntohs(in->sin_port);
-        addr = ntohl(in->sin_addr.s_addr);
-    }
-    ws16_log("connect s16=%u s32=%p name=%p namelen=%d fam=%d %u.%u.%u.%u:%u",
-             s, (void *)(ULONG_PTR)s32, name, namelen,
-             name ? (int)name->sa_family : -1,
-             (addr >> 24) & 255, (addr >> 16) & 255, (addr >> 8) & 255, addr & 255, port);
+    int wsa;
+    unsigned port = 0;
     if (!name || s32 == INVALID_SOCKET)
     {
         WSASetLastError(WSAEFAULT);
-        ws16_log("connect abort WSAEFAULT");
         return SOCKET_ERROR;
     }
-    WSAAsyncSelect(s32, 0, 0, 0);
-    nb = 0;
-    ioctlsocket(s32, FIONBIO, &nb);
+    if (namelen >= 8)
+        port = ntohs(((struct sockaddr_in *)name)->sin_port);
     ret = connect(s32, name, namelen);
-    ws16_log("connect blocking ret=%d wsa=%d", ret, WSAGetLastError());
+    wsa = WSAGetLastError();
+    ws16_log("connect s16=%u ret=%d wsa=%d port=%u async_msg=%u",
+             s, ret, wsa, port, s < WS16_MAX ? ws16_async_msg[s] : 0);
+    if (ret == 0 && s < WS16_MAX)
+        ws16_conn_posted[s] = 1;
+    WSASetLastError(wsa);
     return ret;
 }
 
@@ -806,17 +963,7 @@ SEGPTR WINAPI inet_ntoa16(struct in_addr in)
  */
 INT16 WINAPI ioctlsocket16(SOCKET16 s, LONG cmd, u_long *argp)
 {
-    /* Keep sockets blocking so MFC CSocket Receive() does not wait on FD_READ. */
-    if (cmd == FIONBIO && argp && *argp)
-    {
-        ws16_log("ioctlsocket FIONBIO=1 ignored s16=%u", s);
-        *argp = 0;
-        return 0;
-    }
-    INT16 ret = ioctlsocket( ws16_to_32(s), cmd, argp );
-    ws16_log("ioctlsocket s16=%u cmd=%08lx arg=%lu ret=%d wsa=%d",
-             s, cmd, argp ? *argp : 0, ret, WSAGetLastError());
-    return ret;
+    return ioctlsocket( ws16_to_32(s), cmd, argp );
 }
 
 /***********************************************************************
@@ -853,65 +1000,100 @@ INT16 WINAPI recv16(SOCKET16 s, char *buf, INT16 len, INT16 flags)
     INT16 want = len;
     int fr;
 
-    if (s < WS16_MAX)
+    if (!(flags & MSG_PEEK) && s < WS16_MAX && ws16_hold_len && ws16_hold_s == s
+        && !ws16_hold_defer[s])
+    {
+        INT16 n = (INT16)((unsigned)len < ws16_hold_len ? (unsigned)len : ws16_hold_len);
+        memcpy(buf, ws16_hold, n);
+        ws16_hold_len -= (unsigned)n;
+        if (ws16_hold_len)
+            memmove(ws16_hold, ws16_hold + n, ws16_hold_len);
+        else
+        {
+            ws16_hold_s = 0;
+            ws16_waiting_recv[s] = 0;
+            ws16_unacked[s] = 0;
+        }
         ws16_read_posted[s] = 0;
-    /* A cold-start ident reply often arrives as a header then a payload.
-     * Returning the short read desynchronizes DGIPCLT and WAIT CONNECTING
-     * never leaves. Wait until one full :8001 frame is buffered. */
+        ws16_log("recv s16=%u from stash n=%d left=%u", s, n, ws16_hold_len);
+        return n;
+    }
+
+    /* One DGIP frame per recv so a coalesced ACK+cmd 3 does not desync
+     * DGIPCLT. Do not wait here and do not PostMessage: MFC waits on
+     * FD_READ/FD_CLOSE from WSAAsyncSelect (and the poller retry). */
     if (s32 != INVALID_SOCKET && !(flags & MSG_PEEK))
     {
-        int spins = 0;
-        for (;;)
+        fr = ws16_dgip_frame(s32);
+        if (fr > 0 && want > fr)
+            want = (INT16)fr;
+        else if (fr == 0 && s < WS16_MAX && ws16_async_msg[s]
+                 && !ws16_close_notif[s] && !ws16_is_fin(s32))
         {
-            fd_set rfds;
-            struct timeval tv;
-            u_long avail = 0;
-            int sel;
-
-            fr = ws16_dgip_frame(s32);
-            if (fr < 0)
-                break;
-            if (fr > 0)
+            int spins;
+            for (spins = 0; spins < 8 && fr == 0; spins++)
             {
-                if (want > fr)
+                fd_set rfds;
+                struct timeval tv;
+                FD_ZERO(&rfds);
+                FD_SET(s32, &rfds);
+                tv.tv_sec = 0;
+                tv.tv_usec = 20000;
+                if (select(0, &rfds, NULL, NULL, &tv) < 0)
+                    break;
+                if (ws16_is_fin(s32))
+                    break;
+                fr = ws16_dgip_frame(s32);
+                if (fr > 0 && want > fr)
                     want = (INT16)fr;
-                break;
             }
-            if (++spins > 15)
-                break; /* a short header must not sit forever */
-            FD_ZERO(&rfds);
-            FD_SET(s32, &rfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 200000;
-            sel = select(0, &rfds, NULL, NULL, &tv);
-            if (sel < 0)
+            if (fr <= 0)
+            {
+                ws16_read_posted[s] = 0;
+                ws16_waiting_recv[s] = 1;
+                WSASetLastError(WSAEWOULDBLOCK);
+                {
+                    static unsigned empty_n;
+                    if ((++empty_n % 25) == 1)
+                        ws16_log("recv s16=%u empty/partial DGIP -> WOULDBLOCK (n=%u)", s, empty_n);
+                }
                 return SOCKET_ERROR;
-            if (ioctlsocket(s32, FIONREAD, &avail) == 0 && avail == 0 && sel > 0)
-                break; /* FIN */
+            }
         }
     }
 
     INT16 ret = recv( s32, buf, want, flags );
-    /* DgIpSvr FINs the detect socket after the 8-byte ack. A 0-byte recv is
-     * a CFileException in MFC; Win16 expects WSAEWOULDBLOCK so it can TERM. */
+    if (s < WS16_MAX)
+        ws16_read_posted[s] = 0;
     if (ret == 0)
     {
-        /* First FIN: tell MFC the socket closed. A nested recv from that
-         * handler must return real EOF, or FD_CLOSE reposts forever. */
-        if (s < WS16_MAX && !ws16_close_posted[s])
+        /* First FIN: WSAEWOULDBLOCK so CSocket goes to OnClose. Nested
+         * recv from that handler must return 0. FD_CLOSE is posted by
+         * the poller / WSAAsyncSelect, not from this call. */
+        if (s < WS16_MAX && !ws16_close_posted[s] && !ws16_close_notif[s])
         {
             ws16_close_posted[s] = 1;
             WSASetLastError(WSAEWOULDBLOCK);
-            if (ws16_async_hwnd[s] && ws16_async_msg[s])
-                PostMessageA(HWND_32(ws16_async_hwnd[s]), ws16_async_msg[s], s, MAKELONG(FD_CLOSE, 0));
+            ws16_log("recv s16=%u FIN -> WOULDBLOCK (wait FD_CLOSE)", s);
             return SOCKET_ERROR;
         }
+        ws16_log("recv s16=%u FIN -> 0", s);
         return 0;
     }
-    /* Do not post FD_READ here. PostMessage reenters MFC Receive, then
-     * ws16_read_posted stays set and the ident reply is never delivered. */
-    if (s < WS16_MAX)
-        ws16_read_posted[s] = 0;
+    if (ret == SOCKET_ERROR)
+        ws16_log("recv s16=%u want=%d ret=-1 wsa=%d", s, want, WSAGetLastError());
+    else
+    {
+        if (s < WS16_MAX)
+        {
+            ws16_hold_defer[s] = 0;
+            ws16_waiting_recv[s] = 0;
+            ws16_unacked[s] = 0;
+            if (ws16_hold_len && ws16_hold_s == s)
+                ws16_post_event(s, FD_READ, 0);
+        }
+        ws16_log("recv s16=%u want=%d ret=%d", s, want, ret);
+    }
     return ret;
 }
 
@@ -958,7 +1140,50 @@ INT16 WINAPI select16(INT16 nfds, ws_fd_set16 *ws_readfds,
  */
 INT16 WINAPI send16(SOCKET16 s, char *buf, INT16 len, INT16 flags)
 {
-    INT16 ret = send( ws16_to_32(s), buf, len, flags );
+    SOCKET s32 = ws16_to_32(s);
+    INT16 ret;
+    int dgip = (s32 != INVALID_SOCKET && ws16_dgip_frame(s32) != -1);
+    DWORD now = GetTickCount();
+
+    /* Stash only for a UI nest (down arrow), not for pipelined writes.
+     * Pipeline sends are back-to-back; a click is tens of ms after send. */
+    if (s < WS16_MAX && (ws16_waiting_recv[s]
+        || (ws16_unacked[s] && ws16_last_send_tick[s]
+            && (now - ws16_last_send_tick[s]) >= 15)))
+    {
+        if (ws16_stash_reply(s, s32))
+            ws16_hold_defer[s] = 1;
+    }
+    ret = send(s32, buf, len, flags);
+    if (s < WS16_MAX)
+        ws16_last_send_tick[s] = GetTickCount();
+    if (ret > 0 && dgip && s < WS16_MAX && buf)
+    {
+        if (ws16_snd_need[s] == 0 && ret >= 6)
+        {
+            unsigned plen = (unsigned char)buf[4] | ((unsigned)(unsigned char)buf[5] << 8);
+            if (plen > 8000)
+                plen = 0;
+            ws16_snd_need[s] = 6u + plen;
+            ws16_snd_got[s] = 0;
+        }
+        ws16_snd_got[s] += (unsigned)ret;
+        if (ws16_snd_need[s] && ws16_snd_got[s] >= ws16_snd_need[s])
+        {
+            ws16_unacked[s] = 1;
+            ws16_snd_need[s] = 0;
+            ws16_snd_got[s] = 0;
+        }
+    }
+    ws16_log("send s16=%u len=%d ret=%d cmd=%02x%02x wsa=%d wait=%u unack=%u defer=%u hold=%u",
+             s, len, ret,
+             (buf && len > 0) ? (unsigned char)buf[0] : 0,
+             (buf && len > 1) ? (unsigned char)buf[1] : 0,
+             WSAGetLastError(),
+             s < WS16_MAX ? ws16_waiting_recv[s] : 0,
+             s < WS16_MAX ? ws16_unacked[s] : 0,
+             s < WS16_MAX ? ws16_hold_defer[s] : 0,
+             ws16_hold_s == s ? ws16_hold_len : 0);
     if (ret == 6 && buf && buf[0] == 0x02 && buf[1] == 0 && s < WS16_MAX)
         ws16_term_pending[s] = 1;
     return ret;
@@ -1084,18 +1309,21 @@ INT16 WINAPI gethostname16(char *name, INT16 namelen)
 INT16 WINAPI WSAAsyncSelect16(SOCKET16 s, HWND16 hWnd, UINT16 wMsg, LONG lEvent)
 {
     SOCKET s32 = ws16_to_32(s);
+    HWND proxy = ws16_get_proxy();
     if (s && s < WS16_MAX)
     {
         ws16_async_hwnd[s] = lEvent ? hWnd : 0;
         ws16_async_msg[s] = lEvent ? wMsg : 0;
+        ws16_read_posted[s] = 0;
     }
-    if (hWnd && lEvent)
-        ws16_hook_hwnd(hWnd);
-    /* Cancel here so connect16 can block; re-armed after connect. */
-    WSAAsyncSelect(s32, 0, 0, 0);
-    ws16_log("WSAAsyncSelect s16=%u hwnd16=%04x msg=%u ev=%08lx",
-             s, hWnd, wMsg, lEvent);
-    return 0;
+    if (lEvent)
+        ws16_poller_start();
+    {
+        INT16 ret = WSAAsyncSelect(s32, lEvent ? proxy : 0, lEvent ? WM_WS16_ASYNC : 0, lEvent);
+        ws16_log("WSAAsyncSelect s16=%u hwnd16=%04x msg=%u ev=%08lx proxy=%p ret=%d wsa=%d",
+                 s, hWnd, wMsg, lEvent, proxy, ret, WSAGetLastError());
+        return ret;
+    }
 }
 
 /***********************************************************************
@@ -1366,6 +1594,11 @@ INT WINAPI WSACleanup16(void)
                 WaitForSingleObject(ws16_poller, 1000);
                 CloseHandle(ws16_poller);
                 ws16_poller = NULL;
+            }
+            if (ws16_proxy_hwnd)
+            {
+                DestroyWindow(ws16_proxy_hwnd);
+                ws16_proxy_hwnd = NULL;
             }
             /* delete scratch buffers */
             UnMapLS( he_buffer_seg );
